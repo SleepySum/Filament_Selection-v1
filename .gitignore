@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data
+filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026/train/train_images/*.jpeg
+filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026/test/test_images/*.jpeg
+*.json
+
+# Model checkpoints
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+
+# Logs
+logs/
+*.log
+tensorboard/
+wandb/
+
+# Output
+submission.csv
+*.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large files
+*.npy
+*.npz
+*.h5
+*.hdf5
