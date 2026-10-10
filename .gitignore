@@ -54,7 +54,7 @@ tensorboard/
 wandb/
 
 # Output
-submission.csv
+# submission.csv  # Allow submission.csv to be tracked
 *.csv
 
 # OS
