@@ -1,0 +1,95 @@
+YOU ARE AN EXPERT COMPUTER VISION RESEARCHER AND KAGGLE GRANDMASTER SPECIALIZING 
+IN SOLAR PHYSICS AND INSTANCE SEGMENTATION. YOUR TASK IS TO BUILD, OPTIMIZE, AND 
+DOCUMENT AN END-TO-END, REPRODUCIBLE SOLUTION FOR THE "SOLAR FILAMENT SEGMENTATION 
+CHALLENGE 2026" (IEEE BIGDATA CUP / MAGFiLO DATASET).
+
+EXECUTE ALL WORK IN STRICT ACCORDANCE WITH "MAGFiLO_Solar_Filament_PRD.pdf".
+
+--------------------------------------------------------------------------------
+1. EXECUTIVE GOAL & CONTEXT
+--------------------------------------------------------------------------------
+- Objective: Instance-level segmentation of solar filaments from high-resolution (2048x2048) 
+  8-bit grayscale H-Alpha solar imagery.
+- Primary Evaluation Metric: Panoptic Quality (PQ) @ IoU threshold 0.5.
+  PQ = Σ IoU(y, ŷ) / (|TP| + 0.5|FP| + 0.5|FN|)
+- Key Technical Challenges:
+  1. Preserving thin, thread-like filament "barbs".
+  2. Resolving multi-annotator ground-truth JSON entries (`<annotator_id>-<file_name>`).
+  3. Avoiding 1-to-many fragmentation penalties (1:n links).
+  4. Preventing many-to-one over-merging penalties (m:1 links).
+  5. Suppressing background solar noise.
+
+--------------------------------------------------------------------------------
+2. DATASET LAYOUT & ANNOTATION PARSING RULES
+--------------------------------------------------------------------------------
+Data Path Hierarchy:
+  MAGFiLO_1.0_Kaggle_2026/
+  ├── train/
+  │   ├── train_images/                 # 2048x2048 8-bit grayscale JPEGs (YYYYMMDDHHMMSSII.jpeg)
+  │   └── MAGFiLO_1.0_Annotations_kaggle2026_train.json # COCO JSON
+  └── test/
+      └── test_images/                  # Test set H-Alpha JPEGs
+
+COCO Parsing Directives:
+1. `images[].id` is formatted as `<annotator_id>-<file_name_without_ext>` (e.g., `010401-20160920230134Lh`).
+2. Multiple entries in `images` may reference the same image file with different annotator prefixes. 
+   Treat each `images[].id` as a distinct independent sample in the PyTorch Dataset.
+3. `annotations[].segmentation` contains polygon coordinates `[[x0, y0, ..., xn, yn]]`. 
+   Convert to binary masks using `pycocotools.mask.frPyObjects(poly, 2048, 2048)` and `decode()`.
+4. All categories (1: Left, 2: Right, 3: Unidentifiable, 4: Ambiguous) map to class ID 1.
+5. 3-Channel Adapter: Grayscale input images (1x2048x2048) must be expanded to 3 channels (3x2048x2048) for backbone compatibility.
+
+--------------------------------------------------------------------------------
+3. REQUIRED WORKSPACE FILES & DIRECTORY STRUCTURE
+--------------------------------------------------------------------------------
+Generate a clean, modular Python codebase in the workspace:
+  ├── src/
+  │   ├── dataset.py       # COCO JSON parser, multi-annotator loader, disk masking, CLAHE, PyTorch Dataset
+  │   ├── augmentations.py # Albumentations pipeline (rotations, elastic transforms, gamma)
+  │   ├── models.py        # Instance segmentation backbones (Mask2Former / SOLOv2 / Swin backbone)
+  │   ├── losses.py        # Barb-preserving Tversky Loss (alpha=0.3, beta=0.7) + Focal Loss
+  │   ├── postprocess.py   # Mask NMS (IoU=0.4), Watershed cluster splitting, Barb reconnection
+  │   ├── evaluator.py     # Local validation harness (PyTorch matrix multiplication, PQ, IoU/Dice/M2N)
+  │   └── rle_utils.py     # pycocotools polygon/mask RLE encoding and decoding utilities
+  ├── submission_pipeline.py # End-to-end test inference script generating final submission.csv
+  ├── train.py               # Training script with validation checkpoints
+  ├── requirements.txt       # Dependencies with exact package versions
+  └── solution_demo.ipynb    # Self-contained reproducible demonstration notebook
+
+--------------------------------------------------------------------------------
+4. STEP-BY-STEP IMPLEMENTATION PROTOCOL
+--------------------------------------------------------------------------------
+STEP 1: Implement `src/rle_utils.py` and `src/dataset.py`
+  - Load COCO JSON, map string image IDs to JPEG paths.
+  - Implement Solar Limb Masking (Hough Circle Detection) to zero out deep-space pixels.
+  - Apply CLAHE (clipLimit=2.0, tileGridSize=(8,8)) to boost barb contrast.
+  - Convert annotation polygons to dense binary masks via pycocotools.
+
+STEP 2: Implement `src/evaluator.py`
+  - Replicate official competition evaluator using PyTorch matrix multiplication (`torch.matmul`).
+  - Calculate exact PQ score at IoU threshold = 0.5.
+  - Generate diagnostic distributions: IoU histogram, Dice histogram, 1:n (fragmentation) vs m:1 (over-merging) counts.
+
+STEP 3: Implement `src/losses.py` and `src/models.py`
+  - Build custom Tversky Loss (alpha=0.3, beta=0.7) + Focal Loss to force network focus on thin barbs.
+  - Instantiate Mask2Former (Swin-L backbone) or SOLOv2 instance segmenter.
+
+STEP 4: Implement `src/postprocess.py`
+  - Apply mask-level NMS (IoU threshold = 0.4) to eliminate duplicate instance predictions.
+  - Remove noise instances below min_size threshold (150 pixels).
+  - Apply Watershed clustering on distance transforms to split over-merged filaments.
+
+STEP 5: Implement `submission_pipeline.py`
+  - Run inference on `test/test_images/`.
+  - Convert masks to RLE counts using `pycocotools.mask.encode()`.
+  - Save `submission.csv` with columns `filament_id` and `segmentation_rle`.
+  - Enforce formatting rules: `<image_id>_<idx>` keys, raw RLE strings without quotes, 2048x2048 dimensions.
+
+STEP 6: Generate Technical Report Outline
+  - Draft outline for a 4-page IEEE Overleaf technical report covering pipeline details, multi-annotator handling, ablation studies, and qualitative figures.
+
+BEGIN WORK IMMEDIATELY BY GENERATING PRODUCTION-READY CODE FOR `src/dataset.py`, `src/evaluator.py`, AND `src/rle_utils.py`.
+AND PUSH IT TO THE GIT REPO "git@github.com:SleepySum/Filament_Selection-v1.git"
+
+
+================================================================================

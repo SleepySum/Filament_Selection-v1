@@ -156,10 +156,12 @@ class FilamentEvaluator:
         pred_masks = [m for m in pred_masks if m.sum() >= self.min_instance_area]
         gt_masks = [m for m in gt_masks if m.sum() >= self.min_instance_area]
         
-        if len(pred_masks) == 0 and len(gt_masks) == 0:
+        if len(pred_masks) == 0 or len(gt_masks) == 0:
+            # Per-sample totals only; evaluate_dataset accumulates into self counters.
             return {
-                'pq': 1.0, 'tp': 0, 'fp': 0, 'fn': 0,
-                'sum_iou': 0.0, 'num_pred': 0, 'num_gt': 0
+                'pq': 1.0 if len(pred_masks) == 0 and len(gt_masks) == 0 else 0.0,
+                'tp': 0, 'fp': len(pred_masks), 'fn': len(gt_masks),
+                'sum_iou': 0.0, 'num_pred': len(pred_masks), 'num_gt': len(gt_masks),
             }
         
         # Convert to tensors
@@ -261,11 +263,11 @@ class FilamentEvaluator:
         self.overmerging_counts = []
         
         for pred_masks, gt_masks in zip(predictions, ground_truths):
-            result = self.evaluate_sample(pred_masks, gt_masks)
-            self.tp += result['tp']
-            self.fp += result['fp']
-            self.fn += result['fn']
-            self.sum_iou += result['sum_iou']
+            sample = self.evaluate_sample(pred_masks, gt_masks)
+            self.tp += sample['tp']
+            self.fp += sample['fp']
+            self.fn += sample['fn']
+            self.sum_iou += sample['sum_iou']
         
         # Final PQ
         pq = self.sum_iou / (self.tp + 0.5 * self.fp + 0.5 * self.fn) \

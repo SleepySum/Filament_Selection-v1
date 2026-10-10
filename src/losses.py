@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Dict, List, Optional
 
 
 class TverskyLoss(nn.Module):

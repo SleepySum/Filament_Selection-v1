@@ -1,0 +1,144 @@
+PRODUCT REQUIREMENT DOCUMENT                                            IEEE BIGDATA 2026  V2.4 ACTIVE
+
+MAGFiLO Solar Filament Instance Segmentation Pipeline
+
+Target Metric: Panoptic Quality (PQ) Resolution: 2048 × 2048 H-Alpha Organizer: AURA / NSO / IEEE Deadline: Nov 15, 2026
+
+   1. Executive Overview & Mission
+
+Solar filaments are dense, high-temperature plasma structures suspended by magnetic field lines above the
+solar photosphere. Accurate segmentation of filaments in ground-based H-Alpha observations is critical for
+space weather forecasting, early prediction of Coronal Mass Ejections (CMEs), and solar flare warning systems.
+This Product Requirement Document (PRD) defines the complete technical, architectural, and algorithmic
+specifications for building an automated, state-of-the-art instance segmentation system optimized for the
+MAGFiLO benchmark dataset.
+
+   2. Key Performance Indicators & Targets
+
+      > 0.500                         > 0.780                     < 5.0%                 30 / 30
+
+TARGET PANOPTIC QUALITY            MEAN IOU (TP PAIRS)        FALSE POSITIVE RATE  QUALITATIVE SCORE TARGET
+
+   3. Target Metrics & Benchmark Standards
+
+Quantitative evaluation comprises 70% of the competition score, measured strictly against human expert ground-truth annotations.
+
+Metric Parameter            Baseline        Competitive       Priority  Validation Protocol
+                            System          Target
+                                                                        Kaggle Rescored Engine (IoU > 0.5)
+Panoptic Quality (PQ)       0.285           > 0.520           Critical
+                                                              (70%)     TorchMetrics Segmentation Suite
+                                                                        Boundary-Distance IoU Evaluation
+Segmentation IoU (TP)       0.610           > 0.780           High      Ground-Truth Matching
+                                                                        Correspondence
+Barb Structure Recall       42.0%           > 85.0%           High      Watershed Instance Verification
+
+Fragmentation Ratio (1-to-  1.42 split/fil  < 1.05 split/fil  Medium
+N)
+
+Over-Merge Ratio (N-to-1) 0.31 merge/img < 0.05 merge/img Medium
+
+MAGFiLO Solar Filament Segmentation PRD                                                    Page 1 of 4
+4. Core Engineering Challenges
+
+Fine Barb Retention                      Structural Continuity                   Ground-Based Noise
+
+Thin thread-like barbs extending         Atmospheric turbulence and solar        Observations suffer from limb
+along magnetic field lines carry         background noise cause models to        darkening, cloud interference, and
+crucial chirality data. Standard         fragment contiguous filaments into      varying solar disk contrast across
+models truncate these low-contrast       isolated "islands," incurring heavy PQ  different ground observatories.
+edge details.                            penalties.
+
+5. End-to-End System Architecture
+
+H-Alpha Image       Preprocessing        Instance Backbone                         Post-Processing        COCO RLE
+
+2048 × 2048 Input  Limb Mask + CLAHE       Mask2Former / Swin                    Spine Morph + Watershed   CSV Export
+
+   6. Data Preprocessing & Model Strategy
+
+    Preprocessing Pipeline Protocol:
+     1. Solar Disk Masking: Automated Hough circle detection extracts the solar disk, assigning off-disk deep space
+     background to null.
+     2. Contrast Limited Adaptive Histogram Equalization (CLAHE): Applied with a clip limit of 2.0 and tile grid size of 8×8
+     to enhance low-contrast barb filaments.
+     3. Composite Loss Formulation: To force model attention onto thin features, training utilizes a dual Tversky and Focal
+     Loss formulation:
+
+              Ltotal =  · LFocal +  · LTversky | Tversky(P, G) = |P G| / (|P G| + 0.3|P \ G| + 0.7|G \ P|)
+
+The asymmetry parameters ( = 0.3,  = 0.7) specifically penalize False Negatives (missing barb extensions) at
+more than double the weight of False Positives, ensuring fine thread recovery during gradient optimization.
+
+MAGFiLO Solar Filament Segmentation PRD                                                                   Page 2 of 4
+   7. Topological Post-Processing Refinement
+
+Standard semantic prediction outputs require instance separation and topological reconstruction to prevent
+fragmentation and merging penalties under the Panoptic Quality metric:
+
+1. Noise Filtering                       2. Reconnection                           3. Watershed Split
+
+Applies Connected Component              Executes directional morphological        Uses Distance Transform maps to
+Analysis (CCA) to drop spurious          closing along local filament spine        split overlapping central nodes,
+background artifacts under an area       tangents to join artificially fragmented  resolving many-to-one instance
+threshold of Area < 150 pixels.          segments.                                 merging errors.
+
+   8. Submission Schema & Formatting Standards
+
+Submissions must be exported strictly as a single CSV file adhering to the pycocotools encoding specification.
+
+Column Name  Data        Validation Rule                    Description & Format Example
+filament_id  Type
+                         Must end with unique index suffix  Format: <image_id>_<idx> (e.g.
+             String                                         20150125172714Mh_1)
+                         Unquoted pycocotools RLE count
+segmentation_rle String  string                             Raw unquoted RLE counts (e.g.
+
+                                                            ^Vj02jo16I5O2...)
+
+9. Official Panoptic Quality Metric Formulation
+
+Metric Engine Logic: Panoptic Quality (PQ) evaluates matching segment pairs (y, ) where IoU(y, ) > 0.5:
+                                    PQ(Y, ) = (y, )  TP IoU(y, ) / [ |TP| + 0.5|FP| + 0.5|FN| ]
+
+ Where IoU(y, ) = (y  ) / (y   y  ). Any predicted segment with IoU  0.5 is categorized as a False
+
+Positive, penalizing the denominator.
+
+   10. Non-Functional & Governance Requirements
+
+Open-Access Compliance: The winning solution must be released under a perpetual, royalty-free open-source
+
+license. The Git repository must contain a clean requirements.txt pinning exact library versions and a
+single Jupyter notebook (solution_demo.ipynb) capable of executing the full pipeline deterministically from
+
+raw input images to final submission CSV without external dependencies.
+
+MAGFiLO Solar Filament Segmentation PRD                                                                         Page 3 of 4
+11. Milestone Roadmap & Competition Timeline
+
+      July 10                                Aug 12          Oct 20          Nov 15
+Launch & Baseline                        Metric Rescore  Model Freeze  Final Submission
+
+   12. Repository Structure & Master Prompt Workspace
+
+            # Project Directory Map for AI Autonomous Agent Workspace  src/   dataset.py # H-
+   Alpha loader, solar limb mask, CLAHE enhancement   augmentations.py # Albumentations rotation,
+   gamma, elastic transforms   models.py # Mask2Former / Swin-T instance segmentation network 
+    losses.py # Asymmetric Tversky Loss + Focal Loss for thin barbs   postprocess.py # CCA
+   noise filtering, spine reconnection, watershed   rle_utils.py # pycocotools encoding/decoding
+   functions  submission_pipeline.py # End-to-end inference and validation submission generator
+    requirements.txt # Pinned package versions for full reproducibility  solution_demo.ipynb #
+   Standalone validation and visualization notebook
+
+   13. Agent Implementation Directives
+
+Autonomous engineering agents executing this specification must strictly observe the following constraints:
+· Memory Management: Pre-tile 2048×2048 high-resolution H-Alpha solar images into overlapping 1024×1024
+patches during training, recombining instance masks via Test-Time Augmentation (TTA) during inference.
+· No Hard-coded Suffixes: Ensure instance index generators uniquely tag every predicted mask per image key.
+· Format Verification: Validate that exported RLE strings do not contain quotation marks and map cleanly to
+binary masks matching the source dimensions.
+
+MAGFiLO Solar Filament Segmentation PRD                                Page 4 of 4
+

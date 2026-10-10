@@ -1,12 +1,27 @@
+"""
+Instance segmentation models for solar filament detection.
+
+Two backends are supported:
+- ``Mask2FormerFilament`` (requires `detectron2` — optional, loaded lazily).
+- ``SOLOv2Filament`` / ``FilamentUNet`` (pure PyTorch + timm, always available).
+"""
+import warnings
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
-import timm
-from detectron2.config import get_cfg
-from detectron2.modeling import build_model
-from detectron2.checkpoint import DetectionCheckpointer
-import warnings
+
+try:
+    from detectron2.config import get_cfg as d2_get_cfg
+    from detectron2.modeling import build_model as d2_build_model
+    from detectron2.checkpoint import DetectionCheckpointer
+    HAS_DETECTRON2 = True
+except ImportError:
+    HAS_DETECTRON2 = False
+
 warnings.filterwarnings('ignore')
 
 
@@ -29,13 +44,18 @@ class Mask2FormerFilament(nn.Module):
         enforce_input_project: bool = False,
     ):
         super().__init__()
+        if not HAS_DETECTRON2:
+            raise ImportError(
+                "Mask2FormerFilament requires detectron2. "
+                "Install with: pip install 'git+https://github.com/facebookresearch/detectron2.git'"
+            )
         self.num_classes = num_classes
         self.num_queries = num_queries
         self.hidden_dim = hidden_dim
         
         # Build Mask2Former using detectron2
         self.cfg = self._setup_cfg()
-        self.model = build_model(self.cfg)
+        self.model = d2_build_model(self.cfg)
         
         # Replace classifier head for single class
         self._replace_heads(num_classes)
@@ -44,11 +64,11 @@ class Mask2FormerFilament(nn.Module):
         """Setup detectron2 config for Mask2Former."""
         from detectron2.config import get_cfg
         from detectron2.projects.deeplab import add_deeplab_config
-        from detectron2.projects.mask2former import add_mask2former_config
+        from detectron2.projects import mask2former as mask2former_proj
         
         cfg = get_cfg()
         add_deeplab_config(cfg)
-        add_mask2former_config(cfg)
+        mask2former_proj.add_mask2former_config(cfg)
         
         # Load Mask2Former config
         cfg.merge_from_file(
@@ -351,7 +371,7 @@ class SwinTransformerBackbone(nn.Module):
         return self.model(x)
 
 
-def build_model(model_name: str = 'mask2former', **kwargs) -> nn.Module:
+def build_model(model_name: str = 'unet', **kwargs) -> nn.Module:
     """
     Factory function to build model.
     
@@ -362,7 +382,13 @@ def build_model(model_name: str = 'mask2former', **kwargs) -> nn.Module:
     Returns:
         Model instance
     """
-    if model_name == 'mask2former':
+    if model_name == 'unet':
+        return FilamentUNet(**kwargs)
+    elif model_name == 'mask2former':
+        if not HAS_DETECTRON2:
+            raise ImportError(
+                "mask2former model needs detectron2. Use 'unet' or 'solov2' instead."
+            )
         return Mask2FormerFilament(**kwargs)
     elif model_name == 'solov2':
         return SOLOv2Filament(**kwargs)
@@ -403,24 +429,28 @@ class FilamentUNet(nn.Module):
         # Decoder
         self.decoder = self._build_decoder(enc_channels)
         
-        # Instance head
+        # Heads at full (/1) resolution — decoder outputs 32-ch at /1
         self.instance_head = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=1),
+            nn.Conv2d(32, 64, 3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, num_instances, 1),
         )
         
-        # Semantic head
         self.semantic_head = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=1),
+            nn.Conv2d(32, 64, 3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, num_classes, 1),
         )
     
     def _build_decoder(self, enc_channels: List[int]) -> nn.Module:
-        """Build U-Net decoder."""
+        """Build U-Net decoder with spatially-aligned reverse skips.
+        
+        timm features_only with out_indices=(1,2,3,4) yields strides /4, /8,
+        /16, /32. Starting from /32, each stage upsamples 2x then concatenates
+        the skip at the SAME stride: /16, then /8, then /4.
+        """
         class Decoder(nn.Module):
             def __init__(self, enc_channels):
                 super().__init__()
@@ -428,38 +458,41 @@ class FilamentUNet(nn.Module):
                 self.dec_convs = nn.ModuleList()
                 
                 in_ch = enc_channels[-1]
-                for i in range(len(enc_channels) - 2, -1, -1):
-                    out_ch = enc_channels[i]
+                # Reversed skips: /16 first, then /8, then /4
+                for skip_ch in reversed(enc_channels[:-1]):
                     self.up_convs.append(
-                        nn.ConvTranspose2d(in_ch, out_ch, 2, stride=2)
+                        nn.ConvTranspose2d(in_ch, skip_ch, 2, stride=2)
                     )
                     self.dec_convs.append(
                         nn.Sequential(
-                            nn.Conv2d(out_ch * 2, out_ch, 3, padding=1),
-                            nn.BatchNorm2d(out_ch),
+                            nn.Conv2d(skip_ch * 2, skip_ch, 3, padding=1),
+                            nn.BatchNorm2d(skip_ch),
                             nn.ReLU(inplace=True),
-                            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-                            nn.BatchNorm2d(out_ch),
+                            nn.Conv2d(skip_ch, skip_ch, 3, padding=1),
+                            nn.BatchNorm2d(skip_ch),
                             nn.ReLU(inplace=True),
                         )
                     )
-                    in_ch = out_ch
+                    in_ch = skip_ch
                 
-                self.final_up = nn.ConvTranspose2d(in_ch, 64, 2, stride=2)
+                # /4 -> /2 -> /1 so both heads emit full-resolution logits
+                self.final_up = nn.ConvTranspose2d(in_ch, 32, 2, stride=2)
+                self.final_up2 = nn.ConvTranspose2d(32, 32, 2, stride=2)
                 self.final_conv = nn.Sequential(
-                    nn.Conv2d(64, 64, 3, padding=1),
-                    nn.BatchNorm2d(64),
+                    nn.Conv2d(32, 32, 3, padding=1),
+                    nn.BatchNorm2d(32),
                     nn.ReLU(inplace=True),
                 )
             
             def forward(self, features):
                 x = features[-1]
-                for i, (up, dec) in enumerate(zip(self.up_convs, self.dec_convs)):
+                skips = list(reversed(features[:-1]))  # [/16, /8, /4]
+                for up, dec, skip in zip(self.up_convs, self.dec_convs, skips):
                     x = up(x)
-                    skip = features[i]
                     x = torch.cat([x, skip], dim=1)
                     x = dec(x)
-                x = self.final_up(x)
+                x = self.final_up(x)   # /4 -> /2
+                x = self.final_up2(x)  # /2 -> /1
                 x = self.final_conv(x)
                 return x
         
@@ -482,7 +515,7 @@ class FilamentUNet(nn.Module):
         # Decoder
         dec_feat = self.decoder(feats)
         
-        # Heads
+        # Heads at full (/1) resolution
         instance_logits = self.instance_head(dec_feat)
         semantic_logits = self.semantic_head(dec_feat)
         

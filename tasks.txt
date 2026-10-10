@@ -1,0 +1,21 @@
+✓  Recon: PRD, dataset structure, environment, git remote
+✓  Install missing deps (pycocotools, albumentations, scikit-image, timm)
+✓  Implement src/rle_utils.py
+✓  Implement src/dataset.py (COCO parser, limb mask, CLAHE, multi-annotator handling)
+✓  Implement src/evaluator.py (PQ @0.5 + IoU/Dice/fragmentation diagnostics)
+✓  Implement src/losses.py (Tversky alpha=0.3 beta=0.7 + Focal)
+✓  Implement src/models.py (UNet baseline + lazy Mask2Former/SOLOv2 backends)
+✓  Implement src/postprocess.py (NMS 0.4, min_size 150, watershed, barb reconnect - no ximgproc)
+✓  Implement src/augmentations.py (dual-mask pipeline, Albumentations 2.x)
+✓  Rewrite submission_pipeline.py (standalone preprocessing, RLE format validation)
+✓  Rewrite train.py (correct loss target shape, AMP, shared collate_fn)
+✓  Pin requirements.txt to tested versions (drop detectron2)
+✓  Add report_outline.md (4-page IEEE)
+✓  Add verify_pipeline.py (19 deterministic checks on real dataset)
+✓  Verification suite: 19/19 PASS
+✓  End-to-end training smoke test on real 2048x2048 data: PASS
+☐  Full training run (multiple epochs on all 925 samples) + submission.csv generation
+☐  Mask2Former / SOLOv2 backend training (detectron2 optional, heavy)
+☐  Test-time augmentation (TTA) ensembling in submission_pipeline
+☐  DenseCRF refinement option (pydensecrf)
+☐  Push final artifacts to git@github.com:SleepySum/Filament_Selection-v1.git

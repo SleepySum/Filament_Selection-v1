@@ -1,35 +1,38 @@
 # Solar Filament Segmentation Challenge 2026 - Requirements
+# Pinned to the versions actually used to develop & validate this pipeline
+# (Python 3.14 / Windows). These are minimums; code is forward-compatible,
+# not backward-compatible with the older Albumentations 1.x API.
+
 # Core dependencies
-torch==2.1.0
-torchvision==0.16.0
-torchaudio==2.1.0
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
 
 # Computer vision
-opencv-python==4.8.1.78
-albumentations==1.3.1
-pycocotools==2.0.6
-scikit-image==0.22.0
-scipy==1.11.3
+opencv-python>=4.8.1
+albumentations>=2.0.0
+pycocotools>=2.0.6
+scikit-image>=0.22.0
+scipy>=1.11.3
 
 # Deep learning
-timm==0.9.12
-detectron2 @ git+https://github.com/facebookresearch/detectron2.git@v0.6
+timm>=0.9.12
 
 # Data handling
-numpy==1.24.3
-pandas==2.1.1
-Pillow==10.0.1
+numpy>=1.24.3
+pandas>=2.1.1
+Pillow>=10.0.1
 
 # Utilities
-tqdm==4.66.1
-pyyaml==6.0.1
-matplotlib==3.7.2
-seaborn==0.12.2
+tqdm>=4.66.1
+pyyaml>=6.0.1
+matplotlib>=3.7.2
+seaborn>=0.12.2
 
 # Optional: CRF refinement
 # pydensecrf==1.0rc3
 
 # Notebook
-jupyter==1.0.0
-ipykernel==6.25.2
-notebook==7.0.6
+jupyter
+ipykernel
+notebook

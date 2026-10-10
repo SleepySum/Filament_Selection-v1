@@ -1,16 +1,17 @@
 import os
 import argparse
+from typing import Dict, Optional
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 import numpy as np
 import warnings
 warnings.filterwarnings('ignore')
 
-from src.dataset import SolarFilamentDataset, get_dataloader, create_train_val_split
+from src.dataset import SolarFilamentDataset, create_train_val_split, collate_fn
 from src.models import FilamentUNet, build_model
 from src.losses import TverskyFocalLoss, ComboLoss, create_loss
 from src.augmentations import get_train_augmentations, get_val_augmentations
@@ -65,7 +66,7 @@ def train_epoch(
     optimizer: optim.Optimizer,
     loss_fn: nn.Module,
     device: torch.device,
-    scaler: GradScaler = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
     mixed_precision: bool = False,
 ) -> float:
     """Train for one epoch."""
@@ -77,13 +78,12 @@ def train_epoch(
     for images, targets in pbar:
         images = images.to(device)
         
-        # Prepare targets
-        # For UNet: combine instance masks into single mask
+        # Prepare semantic mask targets for the (B, 1, H, W) semantic head
         batch_masks = []
         for target in targets:
             masks = target['masks']  # (N, H, W)
             if masks.shape[0] > 0:
-                combined = masks.sum(dim=0).clamp(0, 1)
+                combined = (masks.sum(dim=0) > 0).float()
             else:
                 combined = torch.zeros_like(masks[0:1]).squeeze(0)
             batch_masks.append(combined)
@@ -94,16 +94,16 @@ def train_epoch(
         optimizer.zero_grad()
         
         if mixed_precision and scaler:
-            with autocast():
-                instance_logits, semantic_logits = model(images)
-                loss = loss_fn(instance_logits, target_masks)
+            with torch.amp.autocast('cuda', enabled=True):
+                _, semantic_logits = model(images)
+                loss = loss_fn(semantic_logits, target_masks)
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
-            instance_logits, semantic_logits = model(images)
-            loss = loss_fn(instance_logits, target_masks)
+            _, semantic_logits = model(images)
+            loss = loss_fn(semantic_logits, target_masks)
             loss.backward()
             optimizer.step()
         
@@ -134,12 +134,11 @@ def validate(
         for images, targets in tqdm(dataloader, desc='Validation', leave=False):
             images = images.to(device)
             
-            # Prepare targets
             batch_masks = []
             for target in targets:
                 masks = target['masks']
                 if masks.shape[0] > 0:
-                    combined = masks.sum(dim=0).clamp(0, 1)
+                    combined = (masks.sum(dim=0) > 0).float()
                 else:
                     combined = torch.zeros_like(masks[0:1]).squeeze(0)
                 batch_masks.append(combined)
@@ -148,30 +147,27 @@ def validate(
             target_masks = target_masks.unsqueeze(1)
             
             if mixed_precision:
-                with autocast():
-                    instance_logits, semantic_logits = model(images)
-                    loss = loss_fn(instance_logits, target_masks)
+                with torch.amp.autocast('cuda', enabled=True):
+                    _, semantic_logits = model(images)
+                    loss = loss_fn(semantic_logits, target_masks)
             else:
-                instance_logits, semantic_logits = model(images)
-                loss = loss_fn(instance_logits, target_masks)
+                _, semantic_logits = model(images)
+                loss = loss_fn(semantic_logits, target_masks)
             
             total_loss += loss.item()
             num_batches += 1
             
-            # Get predictions for evaluation
-            instance_probs = torch.sigmoid(instance_logits)
+            # Threshold the semantic head at multiple levels to generate
+            # multiple candidate instance masks for the evaluator to choose from.
             semantic_probs = torch.sigmoid(semantic_logits)
-            combined = instance_probs * semantic_probs
             
             for b in range(images.shape[0]):
-                pred_masks = combined[b].cpu().numpy()
-                pred_masks = (pred_masks > 0.5).astype(np.uint8)
-                
-                # Filter by size
+                inst_probs = semantic_probs[b, 0].cpu().numpy()
                 pred_list = []
-                for i in range(pred_masks.shape[0]):
-                    if pred_masks[i].sum() >= 150:
-                        pred_list.append(pred_masks[i])
+                for thr in (0.5, 0.6, 0.7):
+                    m = (inst_probs > thr).astype(np.uint8)
+                    if m.sum() >= 150:
+                        pred_list.append(m)
                 
                 gt_masks = targets[b]['masks'].cpu().numpy()
                 gt_list = [gt_masks[i] for i in range(gt_masks.shape[0]) if gt_masks[i].sum() >= 150]
@@ -244,21 +240,13 @@ def main():
     
     # Create dataloaders
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=lambda x: (torch.stack([i['image'] for i in x]), [i['target'] for i in x]),
-        pin_memory=True,
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
     )
     
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=lambda x: (torch.stack([i['image'] for i in x]), [i['target'] for i in x]),
-        pin_memory=True,
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
     )
     
     # Build model
@@ -278,7 +266,7 @@ def main():
     scheduler = build_scheduler(optimizer, args.epochs)
     
     # Mixed precision
-    scaler = GradScaler() if args.mixed_precision else None
+    scaler = torch.amp.GradScaler('cuda') if args.mixed_precision else None
     
     # Evaluator
     evaluator = FilamentEvaluator(iou_threshold=0.5)

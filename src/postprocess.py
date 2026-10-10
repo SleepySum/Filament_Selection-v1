@@ -1,12 +1,58 @@
+"""
+Topological post-processing refinement for filament instance masks.
+
+Pipeline (per PRD step 7):
+1. Remove small instances (CCA noise filter, Area < 150 px dropped).
+2. Mask-level NMS (IoU threshold = 0.4) to eliminate duplicate instances.
+3. Merge near-identical masks (over-merge correction).
+4. Watershed split of over-merged filaments (many-to-one fix) using
+   distance-transform peaks.
+5. Barb reconnection (morphological closing + skeleton reconnect).
+6. Final size filter.
+
+No dependency on opencv-contrib's ``cv2.ximgproc``; skeletonization uses
+``skimage.morphology.skeletonize``.
+"""
+from typing import Dict, List, Optional, Tuple
+
 import cv2
 import numpy as np
-import torch
 from scipy import ndimage
-from skimage.segmentation import watershed
 from skimage.feature import peak_local_max
-from typing import List, Tuple, Optional, Dict
-import warnings
-warnings.filterwarnings('ignore')
+from skimage.morphology import skeletonize
+from skimage.segmentation import watershed
+
+warnings_suppressed = False
+
+DEFAULT_CONFIG = {
+    "nms_iou_threshold": 0.4,
+    "min_size": 150,
+    "watershed_min_distance": 10,
+    "watershed_threshold_rel": 0.3,
+    "merge_iou_threshold": 0.7,
+    "barb_reconnect": True,
+    "barb_max_gap": 5,
+}
+
+
+def _iou_matrix(masks: np.ndarray) -> np.ndarray:
+    """Fast pairwise IoU between a stack of binary masks."""
+    N = masks.shape[0]
+    flat = masks.reshape(N, -1).astype(np.float32)
+    inter = flat @ flat.T
+    areas = flat.sum(axis=1)
+    union = areas[:, None] + areas[None, :] - inter
+    return inter / (union + 1e-6)
+
+
+def remove_small_instances(
+    masks: np.ndarray, scores: np.ndarray, min_size: int = 150
+) -> Tuple[np.ndarray, np.ndarray]:
+    """CCA noise filter: drop instances whose area < min_size pixels."""
+    if masks.size == 0:
+        return masks, scores
+    keep = masks.sum(axis=(1, 2)) >= min_size
+    return masks[keep], scores[keep]
 
 
 def mask_nms(
@@ -15,448 +61,220 @@ def mask_nms(
     iou_threshold: float = 0.4,
     min_size: int = 150,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Non-Maximum Suppression for instance masks.
-    
-    Args:
-        masks: (N, H, W) binary masks
-        scores: (N,) confidence scores
-        iou_threshold: IoU threshold for suppression
-        min_size: Minimum mask area in pixels
-        
-    Returns:
-        Filtered masks and scores
-    """
-    if len(masks) == 0:
+    """Mask-level Non-Maximum Suppression (IoU threshold = 0.4)."""
+    if masks.size == 0:
         return masks, scores
-    
-    # Filter by minimum size
-    areas = masks.sum(axis=(1, 2))
-    keep_size = areas >= min_size
-    masks = masks[keep_size]
-    scores = scores[keep_size]
-    
-    if len(masks) == 0:
+    keep_size = masks.sum(axis=(1, 2)) >= min_size
+    masks, scores = masks[keep_size], scores[keep_size]
+    if masks.size == 0:
         return masks, scores
-    
-    # Sort by score descending
-    order = scores.argsort()[::-1]
-    masks = masks[order]
-    scores = scores[order]
-    
-    # Compute pairwise IoU
-    N = len(masks)
-    masks_flat = masks.reshape(N, -1).astype(np.float32)
-    
-    # Intersection
-    inter = np.dot(masks_flat, masks_flat.T)
-    
-    # Areas
-    areas = masks_flat.sum(axis=1)
-    
-    # Union
-    union = areas[:, None] + areas[None, :] - inter
-    
-    # IoU
-    iou = inter / (union + 1e-6)
-    
-    # NMS
+
+    order = np.argsort(-scores)
+    masks, scores = masks[order], scores[order]
+
+    iou = _iou_matrix(masks)
     keep = []
-    suppressed = np.zeros(N, dtype=bool)
-    
-    for i in range(N):
+    suppressed = np.zeros(len(masks), dtype=bool)
+    for i in range(len(masks)):
         if suppressed[i]:
             continue
         keep.append(i)
-        # Suppress overlapping masks
-        suppressed[iou[i] > iou_threshold] = True
-        suppressed[i] = False  # Don't suppress self
-    
+        suppressed |= iou[i] > iou_threshold
+        suppressed[i] = False
     return masks[keep], scores[keep]
+
+
+def merge_overlapping_masks(
+    masks: np.ndarray, scores: np.ndarray, iou_threshold: float = 0.7
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Cluster high-IoU (near-identical) masks into single consolidated instances."""
+    if len(masks) <= 1:
+        return masks, scores
+    iou = _iou_matrix(masks)
+    visited = np.zeros(len(masks), dtype=bool)
+    merged_masks, merged_scores = [], []
+    for i in range(len(masks)):
+        if visited[i]:
+            continue
+        cluster = [i]
+        visited[i] = True
+        for j in range(i + 1, len(masks)):
+            if not visited[j] and iou[i, j] > iou_threshold:
+                cluster.append(j)
+                visited[j] = True
+        if len(cluster) == 1:
+            merged_masks.append(masks[i])
+            merged_scores.append(scores[i])
+        else:
+            cluster_masks = masks[cluster]
+            cluster_scores = scores[cluster]
+            weights = cluster_scores / (cluster_scores.sum() + 1e-6)
+            weighted = (cluster_masks * weights[:, None, None]).sum(axis=0)
+            merged_masks.append((weighted > 0.5).astype(np.uint8))
+            merged_scores.append(cluster_scores.max())
+    return np.array(merged_masks), np.array(merged_scores)
 
 
 def watershed_split(
     mask: np.ndarray,
     min_distance: int = 10,
     threshold_rel: float = 0.3,
+    min_size: int = 150,
 ) -> List[np.ndarray]:
-    """
-    Split over-merged filament using watershed on distance transform.
-    
-    Args:
-        mask: Binary mask (H, W)
-        min_distance: Minimum distance between peaks
-        threshold_rel: Relative threshold for peak detection
-        
-    Returns:
-        List of split binary masks
-    """
-    if mask.sum() < 150:
+    """Split an over-merged filament using a distance-transform watershed."""
+    if mask.sum() < 300 or mask.ndim != 2:
         return [mask]
-    
-    # Distance transform
-    distance = ndimage.distance_transform_edt(mask)
-    
-    # Find peaks
+    distance = ndimage.distance_transform_edt(mask.astype(bool))
     coords = peak_local_max(
-        distance,
-        min_distance=min_distance,
-        threshold_rel=threshold_rel,
-        exclude_border=False,
+        distance, min_distance=min_distance, threshold_rel=threshold_rel, exclude_border=False
     )
-    
     if len(coords) <= 1:
         return [mask]
-    
-    # Create markers
     markers = np.zeros_like(mask, dtype=np.int32)
     for i, (y, x) in enumerate(coords):
         markers[y, x] = i + 1
-    
-    # Watershed
-    labels = watershed(-distance, markers, mask=mask)
-    
-    # Extract individual masks
-    split_masks = []
-    for i in range(1, labels.max() + 1):
-        inst_mask = (labels == i).astype(np.uint8)
-        if inst_mask.sum() >= 150:
-            split_masks.append(inst_mask)
-    
-    return split_masks if split_masks else [mask]
+    labels = watershed(-distance, markers, mask=mask.astype(np.uint8))
+    split = [
+        (labels == i).astype(np.uint8)
+        for i in range(1, labels.max() + 1)
+        if (labels == i).sum() >= min_size
+    ]
+    return split if split else [mask]
 
 
-def barb_reconnection(
-    mask: np.ndarray,
-    max_gap: int = 5,
-    min_barb_length: int = 10,
-) -> np.ndarray:
-    """
-    Reconnect fragmented filament barbs using morphological operations.
-    
-    Args:
-        mask: Binary mask (H, W)
-        max_gap: Maximum gap to bridge
-        min_barb_length: Minimum barb length to preserve
-        
-    Returns:
-        Reconnected mask
-    """
-    # Skeletonize to find filament structure
-    skeleton = cv2.ximgproc.thinning((mask * 255).astype(np.uint8))
-    skeleton = skeleton > 0
-    
-    # Find connected components in skeleton
-    num_labels, labels = cv2.connectedComponents(skeleton.astype(np.uint8))
-    
-    if num_labels <= 2:  # Background + 1 component
-        return mask
-    
-    # Analyze each component
-    main_component = None
-    main_size = 0
-    barbs = []
-    
-    for i in range(1, num_labels):
-        comp_mask = (labels == i)
-        comp_size = comp_mask.sum()
-        
-        if comp_size > main_size:
-            if main_component is not None:
-                barbs.append(main_component)
-            main_component = comp_mask
-            main_size = comp_size
-        else:
-            barbs.append(comp_mask)
-    
-    # Try to reconnect barbs to main component
-    if main_component is not None and len(barbs) > 0:
-        # Dilate main component
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max_gap, max_gap))
-        main_dilated = cv2.dilate(main_component.astype(np.uint8), kernel)
-        
-        for barb in barbs:
-            # Check if barb touches dilated main component
-            if (barb & main_dilated).any():
-                # Reconnect by adding barb to main
-                main_component = main_component | barb
-    
-    # Reconstruct mask from reconnected skeleton
-    reconnected = main_component.astype(np.uint8) * 255
-    reconnected = cv2.dilate(reconnected, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-    reconnected = reconnected > 0
-    
-    # Combine with original mask to preserve thickness
-    result = mask | reconnected
-    
-    return result.astype(np.uint8)
+def barb_reconnection(mask: np.ndarray, max_gap: int = 5) -> np.ndarray:
+    """Reconnect small orphaned components back to the dominant filament body."""
+    bin_mask = (mask > 0).astype(np.uint8)
+    num_labels, labels = cv2.connectedComponents(bin_mask)
+    if num_labels <= 2:
+        return bin_mask  # Background + single component, nothing to reconnect
 
+    sizes = ndimage.sum(bin_mask, labels, range(1, num_labels))
+    main_label = int(np.argmax(sizes)) + 1
+    main = (labels == main_label).astype(np.uint8)
+    barbs = [
+        (labels == l).astype(np.uint8)
+        for l in range(1, num_labels)
+        if l != main_label
+    ]
 
-def remove_small_instances(
-    masks: np.ndarray,
-    scores: np.ndarray,
-    min_size: int = 150,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Remove instances below minimum size.
-    
-    Args:
-        masks: (N, H, W) binary masks
-        scores: (N,) confidence scores
-        min_size: Minimum area in pixels
-        
-    Returns:
-        Filtered masks and scores
-    """
-    areas = masks.sum(axis=(1, 2))
-    keep = areas >= min_size
-    return masks[keep], scores[keep]
-
-
-def merge_overlapping_masks(
-    masks: np.ndarray,
-    scores: np.ndarray,
-    iou_threshold: float = 0.7,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Merge highly overlapping masks (likely same filament).
-    
-    Args:
-        masks: (N, H, W) binary masks
-        scores: (N,) confidence scores
-        iou_threshold: IoU threshold for merging
-        
-    Returns:
-        Merged masks and scores
-    """
-    if len(masks) <= 1:
-        return masks, scores
-    
-    N = len(masks)
-    masks_flat = masks.reshape(N, -1).astype(np.float32)
-    
-    # Compute IoU
-    inter = np.dot(masks_flat, masks_flat.T)
-    areas = masks_flat.sum(axis=1)
-    union = areas[:, None] + areas[None, :] - inter
-    iou = inter / (union + 1e-6)
-    
-    # Find clusters of overlapping masks
-    visited = np.zeros(N, dtype=bool)
-    merged_masks = []
-    merged_scores = []
-    
-    for i in range(N):
-        if visited[i]:
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max_gap, max_gap))
+    main_dilated = cv2.dilate(main, kernel)
+    out = main.copy()
+    for barb in barbs:
+        ys, xs = np.where(barb > 0)
+        if len(ys) == 0:
             continue
-        
-        # Find all masks overlapping with this one
-        cluster = [i]
-        visited[i] = True
-        
-        for j in range(i + 1, N):
-            if not visited[j] and iou[i, j] > iou_threshold:
-                cluster.append(j)
-                visited[j] = True
-        
-        # Merge cluster
-        if len(cluster) == 1:
-            merged_masks.append(masks[i])
-            merged_scores.append(scores[i])
-        else:
-            # Weighted merge by scores
-            cluster_masks = masks[cluster]
-            cluster_scores = scores[cluster]
-            
-            # Weighted average
-            weights = cluster_scores / (cluster_scores.sum() + 1e-6)
-            merged_mask = np.zeros_like(masks[0], dtype=np.float32)
-            for m, w in zip(cluster_masks, weights):
-                merged_mask += m * w
-            
-            merged_mask = (merged_mask > 0.5).astype(np.uint8)
-            merged_score = cluster_scores.max()
-            
-            merged_masks.append(merged_mask)
-            merged_scores.append(merged_score)
-    
-    return np.array(merged_masks), np.array(merged_scores)
+        if main_dilated[ys, xs].any():
+            out |= barb
+
+    # Skeletonize the main component to derive a clean spine, then thicken it
+    skel = skeletonize(out > 0).astype(np.uint8)
+    spine = cv2.dilate(skel * 255, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    out |= (spine > 0).astype(np.uint8)
+    return out.astype(np.uint8)
 
 
 def postprocess_masks(
     masks: np.ndarray,
     scores: np.ndarray,
     image: Optional[np.ndarray] = None,
-    config: Dict = None,
+    config: Optional[Dict] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Full postprocessing pipeline for predicted masks.
-    
-    Args:
-        masks: (N, H, W) predicted binary masks
-        scores: (N,) confidence scores
-        image: Original image for barb reconnection (optional)
-        config: Postprocessing configuration
-        
-    Returns:
-        Processed masks and scores
-    """
-    default_config = {
-        'nms_iou_threshold': 0.4,
-        'min_size': 150,
-        'watershed_min_distance': 10,
-        'watershed_threshold_rel': 0.3,
-        'merge_iou_threshold': 0.7,
-        'barb_reconnect': True,
-        'barb_max_gap': 5,
-    }
-    
+    """Full postprocess pipeline. ``image`` is optional (size H, W) for barb reconnect."""
+    cfg = dict(DEFAULT_CONFIG)
     if config:
-        default_config.update(config)
-    
-    cfg = default_config
-    
-    # 1. Remove small instances
-    masks, scores = remove_small_instances(masks, scores, cfg['min_size'])
-    
-    if len(masks) == 0:
+        cfg.update(config)
+
+    masks = np.asarray(masks)
+    scores = np.asarray(scores)
+
+    # 0. Handle empty predictions
+    if masks.size == 0 or scores.size == 0:
+        return np.zeros((0, 2048, 2048), dtype=np.uint8), np.array([])
+
+    # 1. CCA filter (min_size=150 px)
+    masks, scores = remove_small_instances(masks, scores, cfg["min_size"])
+    if masks.size == 0:
         return masks, scores
-    
-    # 2. Mask NMS
-    masks, scores = mask_nms(masks, scores, cfg['nms_iou_threshold'], cfg['min_size'])
-    
-    if len(masks) == 0:
+
+    # 2. Mask NMS (IoU=0.4)
+    masks, scores = mask_nms(masks, scores, cfg["nms_iou_threshold"], cfg["min_size"])
+    if masks.size == 0:
         return masks, scores
-    
-    # 3. Merge overlapping masks
-    masks, scores = merge_overlapping_masks(masks, scores, cfg['merge_iou_threshold'])
-    
-    # 4. Watershed split for over-merged filaments
-    split_masks = []
-    split_scores = []
-    
-    for mask, score in zip(masks, scores):
-        split = watershed_split(
-            mask,
-            min_distance=cfg['watershed_min_distance'],
-            threshold_rel=cfg['watershed_threshold_rel'],
-        )
-        split_masks.extend(split)
-        split_scores.extend([score] * len(split))
-    
-    masks = np.array(split_masks)
-    scores = np.array(split_scores)
-    
+
+    # 3. Merge near-identical masks (over-merge correction)
+    masks, scores = merge_overlapping_masks(masks, scores, cfg["merge_iou_threshold"])
+
+    # 4. Watershed split of over-merged filaments
+    split_masks, split_scores = [], []
+    for m, s in zip(masks, scores):
+        for piece in watershed_split(
+            m,
+            min_distance=cfg["watershed_min_distance"],
+            threshold_rel=cfg["watershed_threshold_rel"],
+        ):
+            split_masks.append(piece)
+            split_scores.append(s)
+    if split_masks:
+        masks = np.array(split_masks)
+        scores = np.array(split_scores)
+    else:
+        masks, scores = np.zeros((0, 2048, 2048), dtype=np.uint8), np.array([])
+
     # 5. Barb reconnection
-    if cfg['barb_reconnect'] and image is not None:
-        reconnected_masks = []
-        for mask in masks:
-            reconnected = barb_reconnection(
-                mask,
-                max_gap=cfg['barb_max_gap'],
-            )
-            reconnected_masks.append(reconnected)
-        masks = np.array(reconnected_masks)
-    
+    if cfg["barb_reconnect"] and masks.size > 0:
+        reconnected = [
+            barb_reconnection(m, max_gap=cfg["barb_max_gap"]) for m in masks
+        ]
+        masks = np.array(reconnected)
+
     # 6. Final size filter
-    masks, scores = remove_small_instances(masks, scores, cfg['min_size'])
-    
+    masks, scores = remove_small_instances(masks, scores, cfg["min_size"])
     return masks, scores
-
-
-def refine_masks_with_crf(
-    image: np.ndarray,
-    masks: np.ndarray,
-    scores: np.ndarray,
-    gaussian_sxy: int = 3,
-    gaussian_compat: float = 3,
-    bilateral_sxy: int = 50,
-    bilateral_srgb: int = 5,
-    bilateral_compat: float = 10,
-) -> np.ndarray:
-    """
-    Refine masks using DenseCRF (requires pydensecrf).
-    
-    Args:
-        image: (H, W, 3) RGB image
-        masks: (N, H, W) binary masks
-        scores: (N,) confidence scores
-        gaussian_sxy: Gaussian pairwise spatial std
-        gaussian_compat: Gaussian pairwise compatibility
-        bilateral_sxy: Bilateral pairwise spatial std
-        bilateral_srgb: Bilateral pairwise color std
-        bilateral_compat: Bilateral pairwise compatibility
-        
-    Returns:
-        Refined masks
-    """
-    try:
-        import pydensecrf.densecrf as dcrf
-        from pydensecrf.utils import unary_from_softmax
-    except ImportError:
-        print("pydensecrf not installed, skipping CRF refinement")
-        return masks
-    
-    H, W = image.shape[:2]
-    refined_masks = []
-    
-    for i, mask in enumerate(masks):
-        # Prepare unary potentials
-        prob_fg = mask.astype(np.float32) * scores[i]
-        prob_bg = 1 - prob_fg
-        
-        unary = np.stack([prob_bg, prob_fg], axis=0)
-        unary = unary.reshape(2, -1)
-        unary = -np.log(unary + 1e-8)
-        
-        # CRF
-        d = dcrf.DenseCRF2D(W, H, 2)
-        d.setUnaryEnergy(unary)
-        
-        # Gaussian pairwise
-        d.addPairwiseGaussian(sxy=gaussian_sxy, compat=gaussian_compat)
-        
-        # Bilateral pairwise
-        d.addPairwiseBilateral(
-            sxy=bilateral_sxy,
-            srgb=bilateral_srgb,
-            rgbim=image,
-            compat=bilateral_compat,
-        )
-        
-        # Inference
-        Q = d.inference(5)
-        refined = np.argmax(Q, axis=0).reshape(H, W)
-        refined_masks.append(refined.astype(np.uint8))
-    
-    return np.array(refined_masks)
 
 
 def postprocess_batch(
     batch_masks: List[np.ndarray],
     batch_scores: List[np.ndarray],
     batch_images: Optional[List[np.ndarray]] = None,
-    config: Dict = None,
+    config: Optional[Dict] = None,
 ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-    """
-    Postprocess a batch of predictions.
-    
-    Args:
-        batch_masks: List of (N, H, W) masks per image
-        batch_scores: List of (N,) scores per image
-        batch_images: List of (H, W, 3) images (optional)
-        config: Postprocessing config
-        
-    Returns:
-        Lists of processed masks and scores
-    """
-    results_masks = []
-    results_scores = []
-    
-    for i, (masks, scores) in enumerate(zip(batch_masks, batch_scores)):
-        image = batch_images[i] if batch_images is not None else None
-        masks, scores = postprocess_masks(masks, scores, image, config)
-        results_masks.append(masks)
-        results_scores.append(scores)
-    
-    return results_masks, results_scores
+    """Postprocess a list of per-image (masks, scores) pairs."""
+    out_masks, out_scores = [], []
+    for i, (m, s) in enumerate(zip(batch_masks, batch_scores)):
+        img = batch_images[i] if batch_images is not None else None
+        m2, s2 = postprocess_masks(m, s, img, config)
+        out_masks.append(m2)
+        out_scores.append(s2)
+    return out_masks, out_scores
+
+
+def refine_masks_with_crf(
+    image: np.ndarray,
+    masks: np.ndarray,
+    scores: np.ndarray,
+) -> np.ndarray:
+    """Optional DenseCRF refinement; silently skipped if pydensecrf is missing."""
+    try:
+        import pydensecrf.densecrf as dcrf
+        from pydensecrf.utils import unary_from_softmax
+    except ImportError:
+        print("pydensecrf not installed, skipping CRF refinement")
+        return masks
+
+    if masks.size == 0:
+        return masks
+    H, W = image.shape[:2]
+    refined = []
+    for i, mask in enumerate(masks):
+        prob_fg = mask.astype(np.float32) * scores[i]
+        prob_bg = 1.0 - prob_fg
+        unary = np.stack([prob_bg, prob_fg], axis=0).reshape(2, -1)
+        d = dcrf.DenseCRF2D(W, H, 2)
+        d.setUnaryEnergy(-np.log(unary + 1e-8))
+        d.addPairwiseGaussian(sxy=3, compat=3)
+        d.addPairwiseBilateral(sxy=50, srgb=5, rgbim=image, compat=10)
+        Q = d.inference(5)
+        refined.append(np.argmax(Q, axis=0).reshape(H, W).astype(np.uint8))
+    return np.array(refined)
